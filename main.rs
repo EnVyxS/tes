@@ -67,107 +67,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx_kraken, mut rx_kraken) = mpsc::unbounded_channel::<String>();
     let (tx_bybit, mut rx_bybit) = mpsc::unbounded_channel::<String>();
 
+    // File: src/main.rs
     // ==============================================================================
-    // UTAS JARINGAN 1: KRAKEN L3 MBO (ISOLASI ASINKRON)
+    // UTAS JARINGAN 1: KRAKEN L3 MBO (ISOLASI ASINKRON DENGAN RECOVERY)
     // ==============================================================================
     let tx_k = tx_kraken.clone();
     let token_k = kraken_ws_token.clone();
     let kraken_task = tokio::spawn(async move {
         let url = "wss://ws-l3.kraken.com/v2";
-        let (ws_stream, response) = match connect_async(url).await {
-            Ok(res) => res,
-            Err(e) => {
-                eprintln!("[KRAKEN-L3] FATAL: Kegagalan jabat tangan: {}", e);
-                return;
-            }
-        };
-        println!("[KRAKEN-L3] Soket terenkripsi aktif. Status: {}", response.status());
-
-        let (mut write, mut read) = ws_stream.split();
-
-        let sub_payload = KrakenSubscription {
-            method: "subscribe".to_string(),
-            params: KrakenSubscriptionParams {
-                channel: "level3".to_string(),
-                symbol: vec!["BTC/USD".to_string()],
-                depth: 10,
-                snapshot: true,
-                token: token_k,
-            },
-        };
-
-        let sub_msg = serde_json::to_string(&sub_payload).unwrap_or_default();
-        if let Err(e) = write.send(Message::Text(sub_msg.into())).await {
-            eprintln!("[KRAKEN-L3] Gagal menyuntikkan paket langganan: {}", e);
-            return;
-        }
-
-        while let Some(msg_result) = read.next().await {
-            match msg_result {
-                Ok(Message::Text(text)) => {
-                    if tx_k.send(text.to_string()).is_err() {
-                        break; // Utas pekerja mati, hentikan pendengaran
-                    }
-                }
-                Ok(Message::Ping(ping)) => {
-                    let _ = write.send(Message::Pong(ping)).await;
-                }
+        
+        loop { // PENAMBAHAN: Loop utama untuk Auto-Reconnect
+            let (ws_stream, response) = match connect_async(url).await {
+                Ok(res) => res,
                 Err(e) => {
-                    eprintln!("[KRAKEN-L3] Koneksi terputus (Latensi ISP/Anomali): {}", e);
-                    break;
+                    eprintln!("[KRAKEN-L3] FATAL: Kegagalan jabat tangan: {}. Mencoba ulang dalam 5 detik...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue; // KOREKSI: Gunakan continue, bukan return
                 }
-                _ => {}
+            };
+            println!("[KRAKEN-L3] Soket terenkripsi aktif. Status: {}", response.status());
+
+            let (mut write, mut read) = ws_stream.split();
+
+            let sub_payload = KrakenSubscription {
+                method: "subscribe".to_string(),
+                params: KrakenSubscriptionParams {
+                    channel: "level3".to_string(),
+                    symbol: vec!["BTC/USD".to_string()],
+                    depth: 10,
+                    snapshot: true,
+                    token: token_k.clone(), // KOREKSI: Tambahkan .clone() karena token berada di dalam loop
+                },
+            };
+
+            let sub_msg = serde_json::to_string(&sub_payload).unwrap_or_default();
+            if let Err(e) = write.send(Message::Text(sub_msg.into())).await {
+                eprintln!("[KRAKEN-L3] Gagal menyuntikkan paket langganan: {}. Mengulang...", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
             }
+
+            while let Some(msg_result) = read.next().await {
+                match msg_result {
+                    Ok(Message::Text(text)) => {
+                        if tx_k.send(text.to_string()).is_err() {
+                            break; 
+                        }
+                    }
+                    Ok(Message::Ping(ping)) => {
+                        let _ = write.send(Message::Pong(ping)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("[KRAKEN-L3] Koneksi terputus (Latensi ISP/Anomali): {}. Re-connecting...", e);
+                        break; // Keluar ke loop terluar untuk menyambung ulang
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await; // Jeda sebelum menyambung ulang
         }
-        println!("[KRAKEN-L3] Utas Jaringan terhenti.");
     });
 
+    // File: src/main.rs
     // ==============================================================================
-    // UTAS JARINGAN 2: BYBIT L2 DEPTH (ISOLASI ASINKRON)
+    // UTAS JARINGAN 2: BYBIT L2 DEPTH (ISOLASI ASINKRON DENGAN RECOVERY)
     // ==============================================================================
     let tx_b = tx_bybit.clone();
     let bybit_task = tokio::spawn(async move {
         let url = "wss://stream.bybit.com/v5/public/spot";
-        let (ws_stream, response) = match connect_async(url).await {
-            Ok(res) => res,
-            Err(e) => {
-                eprintln!("[BYBIT-L2] FATAL: Kegagalan jabat tangan: {}", e);
-                return;
+        
+        loop { // PENAMBAHAN: Loop utama untuk Auto-Reconnect
+            let (ws_stream, response) = match connect_async(url).await {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("[BYBIT-L2] FATAL: Kegagalan jabat tangan: {}. Mencoba ulang dalam 5 detik...", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            println!("[BYBIT-L2] Soket terenkripsi aktif. Status: {}", response.status());
+
+            let (mut write, mut read) = ws_stream.split();
+
+            let sub_payload = BybitSubscription {
+                op: "subscribe".to_string(),
+                args: vec!["orderbook.50.BTCUSDT".to_string()],
+            };
+
+            let sub_msg = serde_json::to_string(&sub_payload).unwrap_or_default();
+            if let Err(e) = write.send(Message::Text(sub_msg.into())).await {
+                eprintln!("[BYBIT-L2] Gagal menyuntikkan paket langganan: {}. Mengulang...", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
             }
-        };
-        println!("[BYBIT-L2] Soket terenkripsi aktif. Status: {}", response.status());
 
-        let (mut write, mut read) = ws_stream.split();
-
-        let sub_payload = BybitSubscription {
-            op: "subscribe".to_string(),
-            args: vec!["orderbook.50.BTCUSDT".to_string()],
-        };
-
-        let sub_msg = serde_json::to_string(&sub_payload).unwrap_or_default();
-        if let Err(e) = write.send(Message::Text(sub_msg.into())).await {
-            eprintln!("[BYBIT-L2] Gagal menyuntikkan paket langganan: {}", e);
-            return;
-        }
-
-        while let Some(msg_result) = read.next().await {
-            match msg_result {
-                Ok(Message::Text(text)) => {
-                    if tx_b.send(text.to_string()).is_err() {
+            while let Some(msg_result) = read.next().await {
+                match msg_result {
+                    Ok(Message::Text(text)) => {
+                        if tx_b.send(text.to_string()).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Ping(ping)) => {
+                        let _ = write.send(Message::Pong(ping)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("[BYBIT-L2] Koneksi terputus (Latensi ISP/Anomali): {}. Re-connecting...", e);
                         break;
                     }
+                    _ => {}
                 }
-                Ok(Message::Ping(ping)) => {
-                    let _ = write.send(Message::Pong(ping)).await;
-                }
-                Err(e) => {
-                    eprintln!("[BYBIT-L2] Koneksi terputus (Latensi ISP/Anomali): {}", e);
-                    break;
-                }
-                _ => {}
             }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        println!("[BYBIT-L2] Utas Jaringan terhenti.");
     });
 
     // File: src/main.rs (Bagian 2)
